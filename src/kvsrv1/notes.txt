@@ -1,0 +1,15 @@
+Part 1: Key/value server with reliable network
+
+1. Implement put and get RPC handlers in server.go
+    - server should have an in memory map of type <string, (string, Tversion)> 
+      to pair the key with its value and version number 
+2. Add RPC-sending code to the put/get methods in client.go
+
+Part 2: Implementing a lock using key/value clerk
+
+The purpose of this part is to have a lock mechanism that is shared and works between different programs
+we will want to track who owns what lock
+
+<key, <value, version>>
+
+<lock_id, <client_id, version>>
