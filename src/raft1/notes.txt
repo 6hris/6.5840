@@ -1,0 +1,24 @@
+Part 3A: leader election
+
+For Figure 2 -> focus on RequestVote RPC, the rules for servers related to elections, and the State related to leader election
+
+To implement:
+
+RequestVote RPC
+
+
+Lets find the flow!
+
+- One instance of Raft is created with Make, a goroutine (ticker) is spun up for this server
+- while the the ticker goroutine is not killed, it periodically checks if a leader election should be started, in an infinite loop:
+    - it checks the server's current state
+    - while server = Leader and the goroutine is not killed, loop infinitely until server is not leader
+    - Now that we know the server is not leader, we need to check if the server has received a heartbeat (boolean check as state)
+        - if no heartbeat, set server to candidate and start election process
+        - if heartbeat, set heartbeat state boolean to False
+
+- Once a leader is created from the election process, a goroutine for sending heartbeats will be created
+    - this goroutine will send heartbeats periodically in an infinite loop to the rest of the servers
+    - in the infinite loop, it will check if its term is out of date and then set its state to follower and end the heartbeats
+
+    
