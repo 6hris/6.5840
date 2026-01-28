@@ -163,15 +163,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.Term >= rf.currentTerm {
+	if args.Term > rf.currentTerm {
+		rf.becomeFollowerLocked(args.Term)
+	} else if args.Term == rf.currentTerm {
 		rf.state = Follower
 		rf.lastContact = time.Now()
 		rf.electionTimeout = getRandomTimeDuration()
-	}
-
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
 	}
 	/*
 		if !(args.PrevLogIndex < len(rf.log) && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm) {
@@ -263,6 +260,20 @@ func getRandomTimeDuration() time.Duration {
 	return time.Duration(500+(rand.Int63()%400)) * time.Millisecond
 }
 
+func (rf *Raft) resetElectionTimerLocked() {
+	rf.lastContact = time.Now()
+	rf.electionTimeout = getRandomTimeDuration()
+}
+
+func (rf *Raft) becomeFollowerLocked(newTerm int) {
+	if newTerm > rf.currentTerm {
+		rf.currentTerm = newTerm
+		rf.votedFor = -1
+	}
+	rf.state = Follower
+	rf.resetElectionTimerLocked()
+}
+
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.currentTerm++
@@ -299,11 +310,7 @@ func (rf *Raft) startElection() {
 			}
 
 			if reply.Term > rf.currentTerm {
-				rf.currentTerm = reply.Term
-				rf.state = Follower
-				rf.votedFor = -1
-				rf.lastContact = time.Now()
-				rf.electionTimeout = getRandomTimeDuration()
+				rf.becomeFollowerLocked(reply.Term)
 				return
 			}
 
@@ -386,14 +393,12 @@ func (rf *Raft) heartbeatLoop() {
 		time.Sleep(100 * time.Millisecond) // hearbeat interval
 		rf.mu.Lock()
 		state := rf.state
+		args := &AppendEntriesArgs{}
+		args.LeaderId = rf.me
+		args.Term = rf.currentTerm
 		rf.mu.Unlock()
 
 		if state == Leader {
-			rf.mu.Lock()
-			args := &AppendEntriesArgs{}
-			args.LeaderId = rf.me
-			args.Term = rf.currentTerm
-			rf.mu.Unlock()
 			// send heartbeat to each server
 			for peer := range rf.peers {
 				if peer == rf.me {
@@ -413,11 +418,7 @@ func (rf *Raft) heartbeatLoop() {
 					}
 
 					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
-						rf.state = Follower
-						rf.votedFor = -1
-						rf.lastContact = time.Now()
-						rf.electionTimeout = getRandomTimeDuration()
+						rf.becomeFollowerLocked(reply.Term)
 						return
 					}
 				}(peer)
