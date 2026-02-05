@@ -8,12 +8,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -89,6 +91,15 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	// !! Lock must be held to call this function !!
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -109,6 +120,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []*LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		return
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -157,27 +182,39 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// 3C
+	XTerm  int
+	XIndex int
+	XLen   int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	reply.XTerm = -1
+	reply.XIndex = -1
+	reply.XLen = len(rf.log)
 
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
-
-	if args.Term > rf.currentTerm {
-		rf.becomeFollowerLocked(args.Term)
-	}
-	rf.state = Follower
-	rf.lastContact = time.Now()
-	rf.electionTimeout = getRandomTimeDuration()
+	rf.becomeFollowerLocked(args.Term)
 	reply.Term = rf.currentTerm
 
-	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Success = false
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		x := args.PrevLogIndex
+		for x > 0 && rf.log[x-1].Term == reply.XTerm {
+			x--
+		}
+		reply.XIndex = x
 		reply.Success = false
 		return
 	}
@@ -196,6 +233,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if i < len(args.Entries) {
 		rf.log = append(rf.log, args.Entries[i:]...)
 	}
+	rf.persist()
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
@@ -217,8 +255,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
+		rf.becomeFollowerLocked(args.Term)
 	}
 	reply.Term = rf.currentTerm
 
@@ -234,8 +271,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && isUpToDate {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
-		rf.lastContact = time.Now()
-		rf.electionTimeout = getRandomTimeDuration()
+		rf.resetElectionTimerLocked()
+		rf.persist()
 	}
 }
 
@@ -289,6 +326,7 @@ func (rf *Raft) becomeFollowerLocked(newTerm int) {
 	if newTerm > rf.currentTerm {
 		rf.currentTerm = newTerm
 		rf.votedFor = -1
+		rf.persist()
 	}
 	rf.state = Follower
 	rf.resetElectionTimerLocked()
@@ -300,6 +338,7 @@ func (rf *Raft) startElection() {
 	termStarted := rf.currentTerm
 	rf.state = Candidate
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.lastContact = time.Now()
 	rf.electionTimeout = getRandomTimeDuration() // 150-300ms
 	votes := 1
@@ -380,6 +419,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	entry := &LogEntry{Command: command, Term: rf.currentTerm}
 	rf.log = append(rf.log, entry)
+	rf.persist()
 	term = rf.currentTerm
 	index = len(rf.log) - 1
 
@@ -506,11 +546,27 @@ func (rf *Raft) sendToPeer(peer int) {
 		rf.nextIndex[rf.me] = progress + 1
 		rf.advanceCommitIndexLocked()
 	} else {
-		if rf.nextIndex[peer] > 1 {
-			rf.nextIndex[peer]--
+		if reply.XTerm == -1 {
+			rf.nextIndex[peer] = reply.XLen
+		} else {
+			last := rf.findLastIndexOfTermLocked(reply.XTerm)
+			if last != -1 {
+				rf.nextIndex[peer] = last + 1
+			} else {
+				rf.nextIndex[peer] = reply.XIndex
+			}
 		}
 	}
 
+}
+
+func (rf *Raft) findLastIndexOfTermLocked(term int) int {
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		if rf.log[i].Term == term {
+			return i
+		}
+	}
+	return -1
 }
 
 func (rf *Raft) advanceCommitIndexLocked() {
