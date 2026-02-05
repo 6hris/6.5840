@@ -372,17 +372,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.state != Leader {
 		isLeader = false
 		term = rf.currentTerm
-		rf.mu.Unlock()
 		return index, rf.currentTerm, isLeader
 	}
 	entry := &LogEntry{Command: command, Term: rf.currentTerm}
 	rf.log = append(rf.log, entry)
 	term = rf.currentTerm
 	index = len(rf.log) - 1
-	rf.mu.Unlock()
 
 	return index, term, isLeader
 }
@@ -472,9 +471,14 @@ func (rf *Raft) sendToPeer(peer int) {
 	args := &AppendEntriesArgs{}
 	args.LeaderId = rf.me
 	args.Term = rf.currentTerm
-	args.Entries = rf.log[rf.nextIndex[peer]:]
+
+	start := rf.nextIndex[peer]
+	entries := make([]*LogEntry, len(rf.log[start:]))
+	copy(entries, rf.log[start:])
+	args.Entries = entries
+
 	args.LeaderCommit = rf.commitIndex
-	args.PrevLogIndex = rf.nextIndex[peer] - 1
+	args.PrevLogIndex = start - 1
 	args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 	rf.mu.Unlock()
 
@@ -501,7 +505,6 @@ func (rf *Raft) sendToPeer(peer int) {
 		rf.matchIndex[rf.me] = progress
 		rf.nextIndex[rf.me] = progress + 1
 		rf.advanceCommitIndexLocked()
-		println()
 	} else {
 		if rf.nextIndex[peer] > 1 {
 			rf.nextIndex[peer]--
